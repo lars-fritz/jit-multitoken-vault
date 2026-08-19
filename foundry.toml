@@ -1,0 +1,23 @@
+[profile.default]
+src = "src"
+test = "test"
+script = "script"
+libs = ["lib"]
+solc_version = "0.8.26"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 10_000
+via_ir = true
+
+remappings = [
+  "v4-core/=lib/v4-core/",
+  "v4-periphery/=lib/v4-periphery/",
+  "forge-std/=lib/forge-std/src/",
+  "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/"
+]
+
+[fmt]
+line_length = 100
+tab_width = 4
+bracket_spacing = true
+

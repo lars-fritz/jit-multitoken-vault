@@ -1,0 +1,11 @@
+cache/
+out/
+broadcast/
+
+
+lib/
+.env
+
+.DS_Store
+lib/
+.env
