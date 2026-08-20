@@ -5,6 +5,7 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
+import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
 import { IPoolManager } from "v4-core/src/interfaces/IPoolManager.sol";
 import { IUnlockCallback } from "v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import { StateLibrary } from "v4-core/src/libraries/StateLibrary.sol";
@@ -46,23 +47,34 @@ contract JITSwapCoordinator is IUnlockCallback, IJITCoordinator, ReentrancyGuard
         address tokenIn,
         uint256 amountIn,
         uint256 amountOut,
-        uint128 liquidity,
-        int24 tickLower,
-        int24 tickUpper
+        uint128 lowerLiquidity,
+        uint128 upperLiquidity,
+        int24 lowerTick,
+        int24 upperTick
     );
     event PoolRiskConfigSet(
         PoolId indexed poolId,
         bool enabled,
-        int24 rangeHalfWidthTicks,
+        int24 baseHalfWidthTicks,
+        int24 maxHalfWidthTicks,
         int24 maxTickMove,
-        uint16 maxTradeBps
+        uint16 maxTradeBps,
+        uint16 volatilityWidthFactorBps,
+        uint16 inventorySkewFactorBps,
+        uint16 primaryTokenAllocationBps,
+        int24 overlapTicks
     );
 
     struct PoolRiskConfig {
         bool enabled;
-        int24 rangeHalfWidthTicks;
+        int24 baseHalfWidthTicks;
+        int24 maxHalfWidthTicks;
         int24 maxTickMove;
         uint16 maxTradeBps;
+        uint16 volatilityWidthFactorBps;
+        uint16 inventorySkewFactorBps;
+        uint16 primaryTokenAllocationBps;
+        int24 overlapTicks;
     }
 
     struct Request {
@@ -71,12 +83,15 @@ contract JITSwapCoordinator is IUnlockCallback, IJITCoordinator, ReentrancyGuard
         uint256 amountIn;
         uint256 minAmountOut;
         uint160 sqrtPriceLimitX96;
-        int24 tickLower;
-        int24 tickUpper;
+        int24 lowerTickLower;
+        int24 lowerTickUpper;
+        int24 upperTickLower;
+        int24 upperTickUpper;
         address trader;
         address recipient;
         uint256 vaultAmount0;
         uint256 vaultAmount1;
+        uint16 primaryTokenAllocationBps;
         bytes32 salt;
     }
 
@@ -96,22 +111,76 @@ contract JITSwapCoordinator is IUnlockCallback, IJITCoordinator, ReentrancyGuard
     function setPoolRiskConfig(
         PoolKey calldata key,
         bool enabled,
-        int24 rangeHalfWidthTicks,
+        int24 baseHalfWidthTicks,
+        int24 maxHalfWidthTicks,
         int24 maxTickMove,
-        uint16 maxTradeBps
+        uint16 maxTradeBps,
+        uint16 volatilityWidthFactorBps,
+        uint16 inventorySkewFactorBps,
+        uint16 primaryTokenAllocationBps,
+        int24 overlapTicks
     ) external onlyOwner {
         if (
-            rangeHalfWidthTicks <= 0 || rangeHalfWidthTicks % key.tickSpacing != 0
-                || maxTickMove <= 0 || maxTickMove >= rangeHalfWidthTicks || maxTradeBps == 0
-                || maxTradeBps > 10_000
+            baseHalfWidthTicks <= 0 || baseHalfWidthTicks % key.tickSpacing != 0
+                || maxHalfWidthTicks < baseHalfWidthTicks
+                || maxHalfWidthTicks % key.tickSpacing != 0 || maxTickMove <= 0
+                || maxTickMove >= baseHalfWidthTicks || maxTradeBps == 0 || maxTradeBps > 10_000
+                || inventorySkewFactorBps > 10_000 || primaryTokenAllocationBps < 5_000
+                || primaryTokenAllocationBps > 10_000 || overlapTicks <= 0
+                || overlapTicks % key.tickSpacing != 0 || overlapTicks >= baseHalfWidthTicks
         ) revert BadRange();
         PoolId id = key.toId();
-        poolRiskConfig[id] = PoolRiskConfig(enabled, rangeHalfWidthTicks, maxTickMove, maxTradeBps);
-        emit PoolRiskConfigSet(id, enabled, rangeHalfWidthTicks, maxTickMove, maxTradeBps);
+        poolRiskConfig[id] = PoolRiskConfig({
+            enabled: enabled,
+            baseHalfWidthTicks: baseHalfWidthTicks,
+            maxHalfWidthTicks: maxHalfWidthTicks,
+            maxTickMove: maxTickMove,
+            maxTradeBps: maxTradeBps,
+            volatilityWidthFactorBps: volatilityWidthFactorBps,
+            inventorySkewFactorBps: inventorySkewFactorBps,
+            primaryTokenAllocationBps: primaryTokenAllocationBps,
+            overlapTicks: overlapTicks
+        });
+        emit PoolRiskConfigSet(
+            id,
+            enabled,
+            baseHalfWidthTicks,
+            maxHalfWidthTicks,
+            maxTickMove,
+            maxTradeBps,
+            volatilityWidthFactorBps,
+            inventorySkewFactorBps,
+            primaryTokenAllocationBps,
+            overlapTicks
+        );
     }
 
     function isActive(PoolId poolId) external view override returns (bool) {
         return activePool[poolId];
+    }
+
+    function previewExecutionBounds(PoolKey calldata key, bool zeroForOne)
+        external
+        view
+        returns (
+            int24 lowerTickLower,
+            int24 lowerTickUpper,
+            int24 upperTickLower,
+            int24 upperTickUpper,
+            uint160 sqrtPriceLimitX96
+        )
+    {
+        PoolRiskConfig memory risk = poolRiskConfig[key.toId()];
+        if (!risk.enabled) revert PoolDisabled();
+        address currency0 = Currency.unwrap(key.currency0);
+        address currency1 = Currency.unwrap(key.currency1);
+        return _executionBounds(
+            key,
+            zeroForOne,
+            risk,
+            vault.relativeVolatilityBps(currency0, currency1),
+            vault.relativeImbalanceBps(currency0, currency1)
+        );
     }
 
     function swapExactIn(
@@ -126,19 +195,27 @@ contract JITSwapCoordinator is IUnlockCallback, IJITCoordinator, ReentrancyGuard
         if (currency0 == address(0) || currency1 == address(0)) revert NativeCurrencyUnsupported();
         if (recipient == address(0) || amountIn == 0) revert BadPair();
 
-        (uint256 vaultAmount0, uint256 vaultAmount1) = vault.beginOperation(currency0, currency1);
-        address tokenIn = zeroForOne ? currency0 : currency1;
         PoolId id = key.toId();
         PoolRiskConfig memory risk = poolRiskConfig[id];
         if (!risk.enabled) revert PoolDisabled();
+        uint256 volatilityBps = vault.relativeVolatilityBps(currency0, currency1);
+        int256 imbalanceBps = vault.relativeImbalanceBps(currency0, currency1);
+        (
+            int24 lowerTickLower,
+            int24 lowerTickUpper,
+            int24 upperTickLower,
+            int24 upperTickUpper,
+            uint160 sqrtPriceLimitX96
+        ) = _executionBounds(key, zeroForOne, risk, volatilityBps, imbalanceBps);
+
+        (uint256 vaultAmount0, uint256 vaultAmount1) = vault.beginOperation(currency0, currency1);
+        address tokenIn = zeroForOne ? currency0 : currency1;
         uint256 inputInventory = zeroForOne ? vaultAmount0 : vaultAmount1;
         if (amountIn > (inputInventory * risk.maxTradeBps) / 10_000) revert TradeTooLarge();
         IERC20(tokenIn).safeTransferFrom(msg.sender, address(this), amountIn);
 
         if (activePool[id]) revert NotActive();
         activePool[id] = true;
-        (int24 tickLower, int24 tickUpper, uint160 sqrtPriceLimitX96) =
-            _executionBounds(key, zeroForOne, risk);
         bytes32 salt = keccak256(abi.encodePacked(address(this), ++nonce));
         Request memory request = Request({
             key: key,
@@ -146,18 +223,22 @@ contract JITSwapCoordinator is IUnlockCallback, IJITCoordinator, ReentrancyGuard
             amountIn: amountIn,
             minAmountOut: minAmountOut,
             sqrtPriceLimitX96: sqrtPriceLimitX96,
-            tickLower: tickLower,
-            tickUpper: tickUpper,
+            lowerTickLower: lowerTickLower,
+            lowerTickUpper: lowerTickUpper,
+            upperTickLower: upperTickLower,
+            upperTickUpper: upperTickUpper,
             trader: msg.sender,
             recipient: recipient,
             vaultAmount0: vaultAmount0,
             vaultAmount1: vaultAmount1,
+            primaryTokenAllocationBps: risk.primaryTokenAllocationBps,
             salt: salt
         });
 
-        uint128 liquidity;
-        (amountOut, liquidity) =
-            abi.decode(poolManager.unlock(abi.encode(request)), (uint256, uint128));
+        uint128 lowerLiquidity;
+        uint128 upperLiquidity;
+        (amountOut, lowerLiquidity, upperLiquidity) =
+            abi.decode(poolManager.unlock(abi.encode(request)), (uint256, uint128, uint128));
         activePool[id] = false;
 
         address tokenOut = zeroForOne ? currency1 : currency0;
@@ -167,7 +248,16 @@ contract JITSwapCoordinator is IUnlockCallback, IJITCoordinator, ReentrancyGuard
         vault.endOperation(currency0, currency1);
 
         emit JITSwap(
-            id, msg.sender, recipient, tokenIn, amountIn, amountOut, liquidity, tickLower, tickUpper
+            id,
+            msg.sender,
+            recipient,
+            tokenIn,
+            amountIn,
+            amountOut,
+            lowerLiquidity,
+            upperLiquidity,
+            lowerTickLower,
+            upperTickUpper
         );
     }
 
@@ -177,15 +267,22 @@ contract JITSwapCoordinator is IUnlockCallback, IJITCoordinator, ReentrancyGuard
         PoolId id = request.key.toId();
         if (!activePool[id]) revert NotActive();
 
-        uint128 liquidity = _liquidityFor(request);
-        if (liquidity == 0) revert InsufficientLiquidity();
-        ModifyLiquidityParams memory position = ModifyLiquidityParams({
-            tickLower: request.tickLower,
-            tickUpper: request.tickUpper,
-            liquidityDelta: int256(uint256(liquidity)),
+        (uint128 lowerLiquidity, uint128 upperLiquidity) = _liquiditiesFor(request);
+        if (lowerLiquidity == 0 || upperLiquidity == 0) revert InsufficientLiquidity();
+        ModifyLiquidityParams memory lowerPosition = ModifyLiquidityParams({
+            tickLower: request.lowerTickLower,
+            tickUpper: request.lowerTickUpper,
+            liquidityDelta: int256(uint256(lowerLiquidity)),
             salt: request.salt
         });
-        poolManager.modifyLiquidity(request.key, position, bytes(""));
+        ModifyLiquidityParams memory upperPosition = ModifyLiquidityParams({
+            tickLower: request.upperTickLower,
+            tickUpper: request.upperTickUpper,
+            liquidityDelta: int256(uint256(upperLiquidity)),
+            salt: keccak256(abi.encode(request.salt, uint256(1)))
+        });
+        poolManager.modifyLiquidity(request.key, lowerPosition, bytes(""));
+        poolManager.modifyLiquidity(request.key, upperPosition, bytes(""));
 
         BalanceDelta swapDelta = poolManager.swap(
             request.key,
@@ -203,45 +300,119 @@ contract JITSwapCoordinator is IUnlockCallback, IJITCoordinator, ReentrancyGuard
         uint256 amountOut = uint128(rawOut);
         if (amountOut < request.minAmountOut) revert InsufficientOutput();
 
-        position.liquidityDelta = -int256(uint256(liquidity));
-        poolManager.modifyLiquidity(request.key, position, bytes(""));
+        lowerPosition.liquidityDelta = -int256(uint256(lowerLiquidity));
+        upperPosition.liquidityDelta = -int256(uint256(upperLiquidity));
+        poolManager.modifyLiquidity(request.key, lowerPosition, bytes(""));
+        poolManager.modifyLiquidity(request.key, upperPosition, bytes(""));
         _resolve(request.key.currency0);
         _resolve(request.key.currency1);
-        return abi.encode(amountOut, liquidity);
+        return abi.encode(amountOut, lowerLiquidity, upperLiquidity);
     }
 
-    function _executionBounds(PoolKey calldata key, bool zeroForOne, PoolRiskConfig memory risk)
+    function _executionBounds(
+        PoolKey calldata key,
+        bool zeroForOne,
+        PoolRiskConfig memory risk,
+        uint256 volatilityBps,
+        int256 imbalanceBps
+    )
         internal
         view
-        returns (int24 tickLower, int24 tickUpper, uint160 sqrtPriceLimitX96)
+        returns (
+            int24 lowerTickLower,
+            int24 lowerTickUpper,
+            int24 upperTickLower,
+            int24 upperTickUpper,
+            uint160 sqrtPriceLimitX96
+        )
     {
         (, int24 currentTick,,) = poolManager.getSlot0(key.toId());
-        int24 centerTick = (currentTick / key.tickSpacing) * key.tickSpacing;
-        tickLower = centerTick - risk.rangeHalfWidthTicks;
-        tickUpper = centerTick + risk.rangeHalfWidthTicks;
-        if (tickLower < TickMath.MIN_TICK || tickUpper > TickMath.MAX_TICK) revert BadRange();
+        int24 spacing = key.tickSpacing;
+        int24 centerTick = _floorToSpacing(currentTick, spacing);
+
+        uint256 widthMultiplierBps =
+            10_000 + (volatilityBps * risk.volatilityWidthFactorBps) / 10_000;
+        uint256 volatilityWidth =
+            (uint256(uint24(risk.baseHalfWidthTicks)) * widthMultiplierBps) / 10_000;
+        volatilityWidth = Math.min(volatilityWidth, uint256(uint24(risk.maxHalfWidthTicks)));
+
+        uint256 absoluteImbalance = uint256(imbalanceBps < 0 ? -imbalanceBps : imbalanceBps);
+        uint256 skewBps = (absoluteImbalance * risk.inventorySkewFactorBps) / 10_000;
+        skewBps = Math.min(skewBps, 8_000);
+        uint256 downWidth = imbalanceBps >= 0
+            ? (volatilityWidth * (10_000 + skewBps)) / 10_000
+            : (volatilityWidth * (10_000 - skewBps)) / 10_000;
+        uint256 upWidth = imbalanceBps >= 0
+            ? (volatilityWidth * (10_000 - skewBps)) / 10_000
+            : (volatilityWidth * (10_000 + skewBps)) / 10_000;
+
+        int24 minimumWidth = risk.overlapTicks + spacing;
+        int24 down = _boundedAlignedWidth(downWidth, minimumWidth, risk.maxHalfWidthTicks, spacing);
+        int24 up = _boundedAlignedWidth(upWidth, minimumWidth, risk.maxHalfWidthTicks, spacing);
+        lowerTickLower = centerTick - down;
+        lowerTickUpper = centerTick + risk.overlapTicks;
+        upperTickLower = centerTick - risk.overlapTicks;
+        upperTickUpper = centerTick + up;
+        if (lowerTickLower < TickMath.MIN_TICK || upperTickUpper > TickMath.MAX_TICK) {
+            revert BadRange();
+        }
 
         int24 limitTick =
             zeroForOne ? currentTick - risk.maxTickMove : currentTick + risk.maxTickMove;
-        if (limitTick <= tickLower || limitTick >= tickUpper) revert BadRange();
+        if (limitTick <= lowerTickLower || limitTick >= upperTickUpper) revert BadRange();
         sqrtPriceLimitX96 = TickMath.getSqrtPriceAtTick(limitTick);
     }
 
-    function _liquidityFor(Request memory request) internal view returns (uint128 liquidity) {
-        if (
-            request.tickLower >= request.tickUpper
-                || request.tickLower % request.key.tickSpacing != 0
-                || request.tickUpper % request.key.tickSpacing != 0
-        ) revert BadRange();
+    function _liquiditiesFor(Request memory request)
+        internal
+        view
+        returns (uint128 lowerLiquidity, uint128 upperLiquidity)
+    {
         (uint160 sqrtPriceX96, int24 tick,,) = poolManager.getSlot0(request.key.toId());
-        if (tick < request.tickLower || tick >= request.tickUpper) revert BadRange();
-        liquidity = LiquidityAmounts.getLiquidityForAmounts(
+        if (
+            tick < request.lowerTickLower || tick >= request.lowerTickUpper
+                || tick < request.upperTickLower || tick >= request.upperTickUpper
+        ) revert BadRange();
+
+        uint256 secondaryBps = 10_000 - request.primaryTokenAllocationBps;
+        uint256 lowerAmount0 = (request.vaultAmount0 * secondaryBps) / 10_000;
+        uint256 lowerAmount1 = (request.vaultAmount1 * request.primaryTokenAllocationBps) / 10_000;
+        uint256 upperAmount0 = request.vaultAmount0 - lowerAmount0;
+        uint256 upperAmount1 = request.vaultAmount1 - lowerAmount1;
+
+        lowerLiquidity = LiquidityAmounts.getLiquidityForAmounts(
             sqrtPriceX96,
-            TickMath.getSqrtPriceAtTick(request.tickLower),
-            TickMath.getSqrtPriceAtTick(request.tickUpper),
-            request.vaultAmount0,
-            request.vaultAmount1
+            TickMath.getSqrtPriceAtTick(request.lowerTickLower),
+            TickMath.getSqrtPriceAtTick(request.lowerTickUpper),
+            lowerAmount0,
+            lowerAmount1
         );
+        upperLiquidity = LiquidityAmounts.getLiquidityForAmounts(
+            sqrtPriceX96,
+            TickMath.getSqrtPriceAtTick(request.upperTickLower),
+            TickMath.getSqrtPriceAtTick(request.upperTickUpper),
+            upperAmount0,
+            upperAmount1
+        );
+    }
+
+    function _floorToSpacing(int24 tick, int24 spacing) internal pure returns (int24 compressed) {
+        compressed = tick / spacing;
+        if (tick < 0 && tick % spacing != 0) --compressed;
+        compressed *= spacing;
+    }
+
+    function _boundedAlignedWidth(uint256 width, int24 minimum, int24 maximum, int24 spacing)
+        internal
+        pure
+        returns (int24)
+    {
+        uint256 bounded = Math.max(width, uint256(uint24(minimum)));
+        bounded = Math.min(bounded, uint256(uint24(maximum)));
+        uint256 spacingUnsigned = uint256(uint24(spacing));
+        bounded = ((bounded + spacingUnsigned - 1) / spacingUnsigned) * spacingUnsigned;
+        if (bounded > uint256(uint24(maximum))) bounded = uint256(uint24(maximum));
+        return int24(uint24(bounded));
     }
 
     function _resolve(Currency currency) internal {

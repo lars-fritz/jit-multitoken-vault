@@ -16,6 +16,7 @@ import { JITFundVault } from "../src/JITFundVault.sol";
 import { JITSwapCoordinator } from "../src/JITSwapCoordinator.sol";
 import { JITSwapHook } from "../src/JITSwapHook.sol";
 import { MockERC20 } from "../src/mocks/MockERC20.sol";
+import { MockVaultOracle } from "../src/mocks/MockVaultOracle.sol";
 
 contract JITSystemTest is Test {
     uint160 internal constant SQRT_PRICE_1_1 = 1 << 96;
@@ -32,6 +33,7 @@ contract JITSystemTest is Test {
     MockERC20 internal x;
     MockERC20 internal y;
     MockERC20 internal z;
+    MockVaultOracle internal oracle;
     PoolKey internal xy;
     PoolKey internal xz;
     PoolKey internal yz;
@@ -41,9 +43,18 @@ contract JITSystemTest is Test {
         x = new MockERC20("X", "X");
         y = new MockERC20("Y", "Y");
         z = new MockERC20("Z", "Z");
+        oracle = new MockVaultOracle();
+        oracle.setPrice(address(x), 1e18, block.timestamp);
+        oracle.setPrice(address(y), 1e18, block.timestamp);
+        oracle.setPrice(address(z), 1e18, block.timestamp);
+        oracle.setRelativeVolatility(address(x), address(y), 2_000, block.timestamp);
+        oracle.setRelativeVolatility(address(x), address(z), 2_000, block.timestamp);
+        oracle.setRelativeVolatility(address(y), address(z), 2_000, block.timestamp);
 
         address[3] memory assets = [address(x), address(y), address(z)];
-        vault = new JITFundVault(assets, address(this));
+        uint16[3] memory weights = [uint16(3334), uint16(3333), uint16(3333)];
+        vault = new JITFundVault(assets, weights, oracle, 1 days, address(this));
+        vault.setDepositFee(30);
         coordinator = new JITSwapCoordinator(manager, vault, address(this));
 
         // V4 dispatches callbacks from address bits. Foundry places the fully
@@ -104,6 +115,55 @@ contract JITSystemTest is Test {
         assertEq(z.balanceOf(address(vault)), 1_000_000 ether);
     }
 
+    function testSingleTokenDepositMintsOraclePricedShares() public {
+        x.mint(bob, 300_000 ether);
+        vm.startPrank(bob);
+        x.approve(address(vault), type(uint256).max);
+        uint256 shares = vault.depositSingle(address(x), 300_000 ether, 99_700 ether, bob);
+        vm.stopPrank();
+        assertEq(shares, 99_700 ether);
+        assertEq(vault.balanceOf(bob), 99_700 ether);
+        assertEq(x.balanceOf(address(vault)), 1_300_000 ether);
+    }
+
+    function testInventoryImbalanceWidensScarceTokenFundedWing() public {
+        x.mint(bob, 300_000 ether);
+        vm.startPrank(bob);
+        x.approve(address(vault), type(uint256).max);
+        vault.depositSingle(address(x), 300_000 ether, 1, bob);
+        vm.stopPrank();
+
+        (int24 lowerLower, int24 lowerUpper, int24 upperLower, int24 upperUpper,) =
+            coordinator.previewExecutionBounds(xy, true);
+        int24 downWidth = lowerUpper - lowerLower;
+        int24 upWidth = upperUpper - upperLower;
+        bool xIsToken0 = Currency.unwrap(xy.currency0) == address(x);
+        if (xIsToken0) assertGt(downWidth, upWidth);
+        else assertGt(upWidth, downWidth);
+    }
+
+    function testStaleOracleRejectsSingleTokenDeposit() public {
+        vm.warp(block.timestamp + 1 days + 1);
+        x.mint(bob, 1 ether);
+        vm.startPrank(bob);
+        x.approve(address(vault), type(uint256).max);
+        vm.expectRevert(JITFundVault.OracleStale.selector);
+        vault.depositSingle(address(x), 1 ether, 1, bob);
+        vm.stopPrank();
+    }
+
+    function testHigherVolatilityWidensBothWings() public {
+        (int24 low0, int24 low1, int24 high0, int24 high1,) =
+            coordinator.previewExecutionBounds(xy, true);
+        uint256 initialWidth = uint256(uint24(low1 - low0)) + uint256(uint24(high1 - high0));
+
+        oracle.setRelativeVolatility(address(x), address(y), 8_000, block.timestamp);
+        (low0, low1, high0, high1,) = coordinator.previewExecutionBounds(xy, true);
+        uint256 volatileWidth = uint256(uint24(low1 - low0)) + uint256(uint24(high1 - high0));
+
+        assertGt(volatileWidth, initialWidth);
+    }
+
     function testAtomicJITSwapReturnsAllLiquidityToVault() public {
         uint256 xBefore = x.balanceOf(address(vault));
         uint256 yBefore = y.balanceOf(address(vault));
@@ -116,8 +176,8 @@ contract JITSystemTest is Test {
         assertEq(y.balanceOf(alice), aliceYBefore + amountOut);
         // Add/remove liquidity can leave a couple of wei in PoolManager because
         // the core deliberately rounds token amounts in opposite directions.
-        assertApproxEqAbs(x.balanceOf(address(vault)), xBefore + 10_000 ether, 2);
-        assertApproxEqAbs(y.balanceOf(address(vault)), yBefore - amountOut, 2);
+        assertApproxEqAbs(x.balanceOf(address(vault)), xBefore + 10_000 ether, 6);
+        assertApproxEqAbs(y.balanceOf(address(vault)), yBefore - amountOut, 6);
         assertEq(x.balanceOf(address(coordinator)), 0);
         assertEq(y.balanceOf(address(coordinator)), 0);
         assertFalse(vault.activeOperation());
@@ -165,7 +225,7 @@ contract JITSystemTest is Test {
     }
 
     function testTerminalTickLimitRejectsPartialFill() public {
-        coordinator.setPoolRiskConfig(xy, true, 1200, 60, 1000);
+        coordinator.setPoolRiskConfig(xy, true, 1200, 3600, 60, 1000, 10_000, 10_000, 9500, 60);
         vm.prank(alice);
         vm.expectRevert(JITSwapCoordinator.PartialFill.selector);
         _swap(xy, address(x), address(y), 100_000 ether, alice);
@@ -195,7 +255,7 @@ contract JITSystemTest is Test {
     }
 
     function _configurePair(PoolKey memory key) internal {
-        coordinator.setPoolRiskConfig(key, true, 1200, 600, 1000);
+        coordinator.setPoolRiskConfig(key, true, 1200, 3600, 600, 1000, 10_000, 10_000, 9500, 60);
     }
 
     function _swap(
